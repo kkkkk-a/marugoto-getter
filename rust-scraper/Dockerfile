@@ -1,5 +1,5 @@
-# 1. ビルド用ステージ
-FROM rust:1.77-slim-bookworm AS builder
+# 1. ビルド用ステージ（最新のRust 1.x系を使用）
+FROM rust:1-slim-bookworm AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release
