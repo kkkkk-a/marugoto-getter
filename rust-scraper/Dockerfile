@@ -1,6 +1,10 @@
-# 1. ビルド用ステージ（最新のRust 1.x系を使用）
+# 1. ビルド用ステージ
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /app
+
+# OpenSSLのコンパイルに必要なパッケージを追加
+RUN apt-get update && apt-get install -y pkg-config libssl-dev
+
 COPY . .
 RUN cargo build --release
 
