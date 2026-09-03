@@ -127,8 +127,13 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    println!("Webアプリが起動しました 🚀 http://localhost:3000");
+    // Render の環境変数 PORT を取得（なければ 3000）
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(3000);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    println!("Webアプリが起動しました 🚀 http://0.0.0.0:{}", port);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
