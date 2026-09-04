@@ -32,6 +32,12 @@ struct ScrapeParams {
     pixiv_cookie: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ProxyParams {
+    url: String,
+    referer: Option<String>,
+}
+
 #[derive(Serialize)]
 struct ScrapeResult {
     title: Option<String>,
@@ -238,7 +244,16 @@ async fn scrape_handler(
                             const json = JSON.parse(meta.content);
                             const illust = json.illust['{}'];
                             if (illust && illust.urls && illust.urls.original) {{
-                                return [illust.urls.original];
+                                const pageCount = illust.pageCount || 1;
+                                if (pageCount === 1) {{
+                                    return [illust.urls.original];
+                                }}
+                                const origBase = illust.urls.original;
+                                const results = [];
+                                for (let p = 0; p < pageCount; p++) {{
+                                    results.push(origBase.replace(/_p0\./, '_p' + p + '.'));
+                                }}
+                                return results;
                             }}
                         }}
                     }} catch(e) {{}}
@@ -501,38 +516,62 @@ async fn scrape_handler(
             .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ページを開けませんでした: {}", e)))?
     };
 
-    // 3. pixiv等の「すべて見る」「もっと見る」ボタンの自動展開 ＆ 深層遅延読み込みスクロール
-    let expand_script = r#"
-        (() => {
-            // pixiv等の展開ボタン（「すべて見る」「もっと見る」等）を探して自動クリック
-            const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+    // 3. pixiv等の「すべて見る」・漫画サイトの「チャプターを見る」展開 ＆ 全自動深層スクロール
+    let expand_and_scroll_script = r#"
+        (async () => {
+            // 「チャプターを見る」「すべて見る」等の展開ボタンをすべて自動クリック
+            const buttons = Array.from(document.querySelectorAll('button, [role="button"], a, div, span, .read-more, .load-more'));
             for (const btn of buttons) {
-                const text = btn.innerText || '';
-                if (text.includes('すべて見る') || text.includes('もっと見る') || text.includes('See all') || text.includes('続きを読む')) {
+                const text = (btn.innerText || btn.textContent || '').trim();
+                if (
+                    text.includes('チャプターを見る') ||
+                    text.includes('チャプター') ||
+                    text.includes('すべて見る') ||
+                    text.includes('もっと見る') ||
+                    text.includes('See all') ||
+                    text.includes('続きを読む') ||
+                    text.includes('Load') ||
+                    text.includes('Read')
+                ) {
                     try { btn.click(); } catch(e) {}
                 }
             }
+
+            // クリック後に画像がDOMに読み込まれるまで1秒待機
+            await new Promise(r => setTimeout(r, 1200));
+
+            // 漫画サイトの全ページ画像を読み込ませるため、下部まで段階的に自動スクロール
+            await new Promise((resolve) => {
+                let totalHeight = 0;
+                const distance = 400;
+                let steps = 0;
+                const maxSteps = 100; // 無限スクロール対策（最大約40000px）
+                const timer = setInterval(() => {
+                    const scrollHeight = document.body.scrollHeight;
+                    window.scrollBy(0, distance);
+                    totalHeight += distance;
+                    steps++;
+
+                    if (totalHeight >= scrollHeight || steps >= maxSteps) {
+                        clearInterval(timer);
+                        window.scrollTo(0, 0); // スクロール完了後に最上部へ戻す
+                        resolve();
+                    }
+                }, 100);
+            });
         })()
     "#;
-    let _ = page.evaluate(expand_script).await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    let _ = page.evaluate(expand_and_scroll_script).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
 
-    // ページ全体を段階的にスクロールして全ページのLazyLoad画像を確実にトリガー
-    let _ = page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.33);").await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    let _ = page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.66);").await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    let _ = page.evaluate("window.scrollTo(0, document.body.scrollHeight);").await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
-
-    // 4. JavaScript実行・描画完了後の完全なDOM HTMLを取得
-    let html_content = page
-        .content()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("HTMLの取得に失敗: {}", e)))?;
-
-    // 5. タブを閉じてメモリ解放
+    // 4. JavaScript実行・描画完了後の完全なDOM HTMLを取得（エラー時も確実にタブを閉じてメモリ解放）
+    let html_content_result = page.content().await;
     let _ = page.close().await;
+
+    let html_content = match html_content_result {
+        Ok(content) => content,
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("HTMLの取得に失敗: {}", e))),
+    };
 
     let document = Html::parse_document(&html_content);
 
@@ -622,7 +661,16 @@ async fn scrape_handler(
         }
     }
 
-    let img_attributes = ["data-original", "data-src", "data-lazy-src", "src"];
+    let img_attributes = [
+        "data-original",
+        "data-src",
+        "data-lazy-src",
+        "data-pagesrc",
+        "data-full-url",
+        "data-url",
+        "data-cfsrc",
+        "src",
+    ];
     for element in document.select(&IMG_SELECTOR) {
         let mut found_for_element = false;
 
@@ -1155,7 +1203,7 @@ async fn download_handler(
 // 外部画像・メディアダウンロード時のCORS制約を回避するプロキシハンドラ
 async fn proxy_handler(
     State(state): State<AppState>,
-    Query(params): Query<ScrapeParams>,
+    Query(params): Query<ProxyParams>,
 ) -> Result<Response, (StatusCode, String)> {
     let parsed_url = Url::parse(&params.url)
         .map_err(|_| (StatusCode::BAD_REQUEST, "無効な URL です。".to_string()))?;
@@ -1169,7 +1217,10 @@ async fn proxy_handler(
     let mut req_builder = state.client.get(parsed_url.as_str());
 
     let host = parsed_url.host_str().unwrap_or("");
-    if host.contains("pximg.net") || host.contains("pixiv") {
+    if let Some(ref ref_url) = params.referer {
+        // 親ページのURLが指定されている場合はそれを最優先（漫画サイトCDN等に有効）
+        req_builder = req_builder.header(reqwest::header::REFERER, ref_url.as_str());
+    } else if host.contains("pximg.net") || host.contains("pixiv") {
         req_builder = req_builder.header(reqwest::header::REFERER, "https://www.pixiv.net/");
     } else if host.contains("twimg.com") || host.contains("twitter") || host.contains("x.com") {
         req_builder = req_builder.header(reqwest::header::REFERER, "https://x.com/");
@@ -1267,12 +1318,13 @@ async fn pdf_handler(
         .print_background(true)
         .build();
 
-    let pdf_bytes = page
-        .pdf(pdf_options)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PDF生成失敗: {}", e)))?;
-
+    let pdf_bytes_result = page.pdf(pdf_options).await;
     let _ = page.close().await;
+
+    let pdf_bytes = match pdf_bytes_result {
+        Ok(bytes) => bytes,
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("PDF生成失敗: {}", e))),
+    };
 
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/pdf"));

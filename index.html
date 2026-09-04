@@ -325,8 +325,8 @@
     // 動画や音声ファイルをプロキシ経由または直接Blob化して保存する関数
     async function directDownloadMedia(url, defaultFilename) {
       try {
-        // CORS回避のため/proxy経由で取得
-        const proxyUrl = `/proxy?url=${encodeURIComponent(url)}`;
+        // CORS・403回避のため元ページReferer付きで/proxy経由で取得
+        const proxyUrl = `/proxy?url=${encodeURIComponent(url)}&referer=${encodeURIComponent(currentScrapedUrl)}`;
         const res = await fetch(proxyUrl);
         if (!res.ok) throw new Error('Fetch failed');
         const blob = await res.blob();
@@ -439,7 +439,7 @@
           btn.innerText = `⏳ ZIP作成中 (${i + 1}/${selected.length})...`;
 
           try {
-            const res = await fetch(`/proxy?url=${encodeURIComponent(url)}`);
+            const res = await fetch(`/proxy?url=${encodeURIComponent(url)}&referer=${encodeURIComponent(currentScrapedUrl)}`);
             if (!res.ok) continue;
             const originalBlob = await res.blob();
             const originalExt = detectImageExtension(url, originalBlob.type, 'jpg');
@@ -489,7 +489,7 @@
         const url = selected[i];
         btn.innerText = `💾 保存中 (${i + 1}/${selected.length})...`;
         try {
-          const res = await fetch(`/proxy?url=${encodeURIComponent(url)}`);
+          const res = await fetch(`/proxy?url=${encodeURIComponent(url)}&referer=${encodeURIComponent(currentScrapedUrl)}`);
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const originalBlob = await res.blob();
           const originalExt = detectImageExtension(url, originalBlob.type, 'jpg');
@@ -699,8 +699,8 @@
           sizeBadge.className = 'size-badge';
 
           const img = document.createElement('img');
-          // Pixiv等の外部画像アクセス拒否(403)を防ぐため、プロキシ経由でプレビュー画像を読み込む
-          img.src = `/proxy?url=${encodeURIComponent(src)}`;
+          // 漫画サイト・Pixiv等のアクセス拒否(403)を防ぐため、元ページURLをrefererとして付与
+          img.src = `/proxy?url=${encodeURIComponent(src)}&referer=${encodeURIComponent(currentScrapedUrl)}`;
           img.loading = 'lazy';
           
           img.onload = () => {
