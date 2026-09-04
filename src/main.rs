@@ -2,7 +2,7 @@ use axum::{
     extract::{Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html as HtmlResponse, IntoResponse, Json, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use chromiumoxide::browser::{Browser, BrowserConfig};
@@ -24,12 +24,35 @@ struct AppState {
     client: reqwest::Client,
     browser: Arc<Browser>,
     pixiv_phpsessid: Option<String>,
+    twitter_auth_token: Option<String>,
+    browser_semaphore: Arc<tokio::sync::Semaphore>,
+    download_semaphore: Arc<tokio::sync::Semaphore>,
+    rate_limiter: Arc<tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>>,
+}
+
+impl AppState {
+    async fn check_rate_limit(&self, ip: std::net::IpAddr) -> bool {
+        let mut map = self.rate_limiter.lock().await;
+        let now = std::time::Instant::now();
+        // 5分以上古いエントリを自動クリーンアップ
+        map.retain(|_, (_, time)| now.duration_since(*time) < Duration::from_secs(300));
+        
+        let entry = map.entry(ip).or_insert((0, now));
+        if now.duration_since(entry.1) > Duration::from_secs(60) {
+            *entry = (1, now);
+            true
+        } else {
+            entry.0 += 1;
+            entry.0 <= 30 // 1分間に最大30リクエストまで許可
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct ScrapeParams {
     url: String,
     pixiv_cookie: Option<String>,
+    twitter_cookie: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -79,30 +102,50 @@ async fn main() {
         }
     }
 
-    // 1. reqwest クライアント作成
+    // 1. reqwest クライアント作成（接続プール拡大＋TCP最適化＋SSL許容）
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .pool_max_idle_per_host(20) // 同一ホストへの並列コネクション維持数を拡大
+        .tcp_nodelay(true)          // パケット遅延を最小化
+        .danger_accept_invalid_certs(true)
         .build()
         .unwrap();
 
-    // 2. ヘッドレストブラウザ（Chromium/Chrome）の常駐起動（Render無料枠 512MB メモリ特化）
-    println!("🌐 ヘッドレスブラウザ (Chromium) を起動中...");
-    let (browser, mut handler) = Browser::launch(
-        BrowserConfig::builder()
+    // 2. ヘッドレストブラウザ（Chromium/Chrome）の常駐起動（macOS / Linux自動最適化）
+    println!("🌐 ヘッドレストブラウザ (Chromium) を起動中...");
+    let mut config_builder = BrowserConfig::builder();
+
+    // Dockerfile等で CHROME_BIN が指定されている場合はそのパスを使用
+    if let Ok(path) = std::env::var("CHROME_BIN") {
+        config_builder = config_builder.chrome_executable(path);
+    }
+
+    // 普段使いのChromeとのプロファイル衝突・強制終了を防ぐため、独立した一時ディレクトリを割り当て
+    let temp_profile = format!("/tmp/chrome_profile_{}", std::process::id());
+    config_builder = config_builder.arg(format!("--user-data-dir={}", temp_profile));
+
+    // Linux環境（RenderやDockerコンテナ等）でのみ必須となるフラグを付与（macOSでのクラッシュを防止）
+    if cfg!(target_os = "linux") {
+        config_builder = config_builder
             .no_sandbox()
             .arg("--disable-gpu")
             .arg("--disable-dev-shm-usage")
-            .arg("--disable-setuid-sandbox")
-            .arg("--no-zygote")
-            .arg("--single-process")
-            .arg("--disable-extensions")
-            .arg("--disable-background-networking")
-            .arg("--disable-software-rasterizer")
-            .arg("--mute-audio")
-            .arg("--no-first-run")
-            .arg("--js-flags=--max-old-space-size=256")
+            .arg("--disable-setuid-sandbox");
+    } else {
+        // macOS (Chrome 120+) でのクラッシュ・フリーズを防ぐ最新ヘッドレスモード指定
+        config_builder = config_builder.arg("--headless=new");
+    }
+
+    // Chromium起動引数に軽量化オプションを追加
+    let (browser, mut handler) = Browser::launch(
+        config_builder
             .arg("--disable-blink-features=AutomationControlled")
+            .arg("--disable-background-timer-throttling")
+            .arg("--disable-backgrounding-occluded-windows")
+            .arg("--disable-renderer-backgrounding")
+            .arg("--disable-extensions")
+            .arg("--disable-component-extensions-with-background-pages")
             .arg("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
             .build()
             .expect("Chromiumの設定に失敗しました"),
@@ -110,31 +153,50 @@ async fn main() {
     .await
     .expect("Chrome/Chromiumが見つかりません。Google ChromeまたはChromiumをインストールしてください。");
 
-    // ブラウザイベントのバックグラウンド監視タスク
+    // ブラウザイベントのバックグラウンド駆動タスク（通信ポンプを常時稼働させる）
     tokio::spawn(async move {
-        while let Some(event) = handler.next().await {
-            if let Err(e) = event {
-                // エラーが出ても終了(break)させず、ログ出力のみで監視を維持する
-                eprintln!("Browser handler event error: {:?}", e);
-            }
+        while let Some(_event) = handler.next().await {
+            // chromiumoxideの内部メッセージをバックグラウンドで安全に処理・ディスパッチし続ける
         }
     });
 
-    // 環境変数 PIXIV_PHPSESSID（PixivログインCookie）を取得
+    // 環境変数 PIXIV_PHPSESSID（Pixivログイン Cookie）を取得
     let pixiv_phpsessid = std::env::var("PIXIV_PHPSESSID").ok();
     if pixiv_phpsessid.is_some() {
-        println!("🔑 Pixiv ログインCookieを検出しました（R-18・限定作品取得対応）");
+        println!("🔑 Pixiv ログイン Cookieを検出しました（R-18・限定作品取得対応）");
     }
+
+    // 環境変数 TWITTER_AUTH_TOKEN（X/Twitterログイン Cookie）を取得
+    let twitter_auth_token = std::env::var("TWITTER_AUTH_TOKEN").ok();
+    if twitter_auth_token.is_some() {
+        println!("🔑 X (Twitter) ログイン Cookieを検出しました");
+    }
+
+    // yt-dlp の24時間ごとの自動アップデートタスク（仕様変更による停止を防止）
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(86400)).await;
+            let _ = Command::new("yt-dlp")
+                .arg("-U")
+                .output()
+                .await;
+        }
+    });
 
     let state = AppState {
         client,
         browser: Arc::new(browser),
         pixiv_phpsessid,
+        twitter_auth_token,
+        browser_semaphore: Arc::new(tokio::sync::Semaphore::new(3)),  // Chromium同時最大3件
+        download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)), // ダウンロード同時最大2件
+        rate_limiter: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let app = Router::new()
         .route("/", get(index_handler))
-        .route("/scrape", get(scrape_handler))
+        .route("/health", get(health_handler))
+        .route("/scrape", post(scrape_handler).get(scrape_handler_get))
         .route("/download", get(download_handler))
         .route("/video-formats", get(video_formats_handler))
         .route("/proxy", get(proxy_handler))
@@ -151,17 +213,91 @@ async fn main() {
     println!("Webアプリが起動しました 🚀 http://0.0.0.0:{}", port);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 async fn index_handler() -> HtmlResponse<&'static str> {
     HtmlResponse(include_str!("../index.html"))
 }
 
-// スクレイピング処理 (ヘッドレスChromiumによる動的レンダリング対応)
+// クラウド死活監視用ヘルスチェックハンドラ（Chromiumプロセスの生存も確認）
+async fn health_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, &'static str) {
+    if state.browser.version().await.is_ok() {
+        (StatusCode::OK, "OK")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "Browser Process Unhealthy")
+    }
+}
+
+// スクレイピング処理 (POST: JSON Body から安全にパラメータを受け取る)
 async fn scrape_handler(
     State(state): State<AppState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+    Json(params): Json<ScrapeParams>,
+) -> Result<Json<ScrapeResult>, (StatusCode, String)> {
+    if !state.check_rate_limit(addr.ip()).await {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "短時間にリクエストが多すぎます。1分ほど待ってから再試行してください。".to_string(),
+        ));
+    }
+
+    // 同時実行制限：5秒以内にスロットが空かない場合は混雑エラーを返却
+    let _permit = match tokio::time::timeout(Duration::from_secs(5), state.browser_semaphore.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        _ => return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "現在アクセスが集中しています。恐れ入りますが、数十秒ほど待ってから再度お試しください。".to_string(),
+        )),
+    };
+
+    // 30秒の全体タイムアウトを設定し、画面が「取得中...」のまま永久フリーズするのを防止
+    let scrape_future = do_scrape(state.clone(), params);
+    match tokio::time::timeout(Duration::from_secs(30), scrape_future).await {
+        Ok(result) => result,
+        Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, "ページの読み込みがタイムアウトしました（30秒）。サイトが重いかブロックされている可能性があります。".to_string())),
+    }
+}
+
+// 従来の GET リクエスト用のフォールバックハンドラ
+async fn scrape_handler_get(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
     Query(params): Query<ScrapeParams>,
+) -> Result<Json<ScrapeResult>, (StatusCode, String)> {
+    if !state.check_rate_limit(addr.ip()).await {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "短時間にリクエストが多すぎます。1分ほど待ってから再試行してください。".to_string(),
+        ));
+    }
+
+    // 同時実行制限：5秒以内にスロットが空かない場合は混雑エラーを返却
+    let _permit = match tokio::time::timeout(Duration::from_secs(5), state.browser_semaphore.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        _ => return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "現在アクセスが集中しています。恐れ入りますが、数十秒ほど待ってから再度お試しください。".to_string(),
+        )),
+    };
+
+    let scrape_future = do_scrape(state.clone(), params);
+    match tokio::time::timeout(Duration::from_secs(30), scrape_future).await {
+        Ok(result) => result,
+        Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, "ページの読み込みがタイムアウトしました（30秒）。サイトが重いかブロックされている可能性があります。".to_string())),
+    }
+}
+
+async fn do_scrape(
+    state: AppState,
+    params: ScrapeParams,
 ) -> Result<Json<ScrapeResult>, (StatusCode, String)> {
     let base_url = Url::parse(&params.url).map_err(|_| {
         (StatusCode::BAD_REQUEST, "無効なURLです。".to_string())
@@ -172,8 +308,63 @@ async fn scrape_handler(
         return Err((StatusCode::BAD_REQUEST, "http または https のURLを指定してください。".to_string()));
     }
 
-    // --- Pixiv専用：個別作品 および 作者ユーザーページの原寸画像一覧取得 ---
     let host = base_url.host_str().unwrap_or("");
+
+    // --- Bluesky専用：公式公開APIを用いた超高速・直接取得（ブラウザ不要でRAM消費ゼロ） ---
+    if host.contains("bsky.app") {
+        let path = base_url.path();
+        if path.contains("/profile/") && path.contains("/post/") {
+            let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            if parts.len() >= 4 && parts[0] == "profile" && parts[2] == "post" {
+                let user_handle = parts[1];
+                let post_rkey = parts[3];
+                let at_uri = format!("at://{}/app.bsky.feed.post/{}", user_handle, post_rkey);
+                let api_url = format!("https://public.api.bsky.app/xrpc/app.bsky.feed.getPostThread?uri={}&depth=0", at_uri);
+
+                if let Ok(api_res) = state.client.get(&api_url).send().await {
+                    if let Ok(json) = api_res.json::<Value>().await {
+                        if let Some(post) = json.pointer("/thread/post") {
+                            let author_name = post.pointer("/author/displayName")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(user_handle);
+                            let title = Some(format!("Bluesky - {}", author_name));
+
+                            let mut paragraphs = Vec::new();
+                            if let Some(text) = post.pointer("/record/text").and_then(|v| v.as_str()) {
+                                if !text.trim().is_empty() {
+                                    paragraphs.push(text.trim().to_string());
+                                }
+                            }
+
+                            let mut images = Vec::new();
+                            if let Some(imgs) = post.pointer("/embed/images").and_then(|v| v.as_array()) {
+                                for img in imgs {
+                                    if let Some(full) = img.get("fullsize").and_then(|v| v.as_str()) {
+                                        images.push(full.to_string());
+                                    }
+                                }
+                            }
+
+                            let mut videos = Vec::new();
+                            if let Some(playlist) = post.pointer("/embed/playlist").and_then(|v| v.as_str()) {
+                                videos.push(playlist.to_string());
+                            }
+
+                            return Ok(Json(ScrapeResult {
+                                title,
+                                paragraphs,
+                                images,
+                                videos,
+                                audios: Vec::new(),
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Pixiv専用：個別作品 および 作者ユーザーページの原寸画像一覧取得 ---
     if host.contains("pixiv.net") {
         let mut illust_id: Option<String> = None;
         let mut user_id: Option<String> = None;
@@ -221,13 +412,14 @@ async fn scrape_handler(
                     .http_only(true)
                     .secure(true)
                     .build();
-                if let Ok(params) = cookie_params {
-                    let _ = page.execute(params).await;
+                if let Ok(p_cookie) = cookie_params {
+                    let _ = page.execute(p_cookie).await;
                 }
             }
 
-            // Cookieセット後に目的のURLへ移動
+            // Cookieセット後に目的のURLへ移動し、ロードを待機
             let _ = page.goto(base_url.as_str()).await;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
 
             let fetch_script = format!(r#"
                 (async () => {{
@@ -285,6 +477,7 @@ async fn scrape_handler(
                 .ok()
                 .and_then(|v| v.into_value::<String>().ok());
 
+            // 終了時に確実にタブを閉じてメモリ解放
             let _ = page.close().await;
 
             if !pixiv_images.is_empty() {
@@ -376,6 +569,7 @@ async fn scrape_handler(
                 .ok()
                 .and_then(|v| v.into_value::<String>().ok());
 
+            // 成功・失敗に関わらず確実にタブを閉じる
             let _ = page.close().await;
 
             if !user_images.is_empty() {
@@ -389,7 +583,7 @@ async fn scrape_handler(
             } else {
                 return Err((
                     StatusCode::NOT_FOUND,
-                    "🔒 作品が見つかりませんでした（作品が非公開、またはR-18作品のみの場合はCookie設定が必要です）。".to_string(),
+                    "🔒 作品が見つかりませんでした（作品が非公開、または R-18作品のみの場合は Cookie設定が必要です）。".to_string(),
                 ));
             }
         }
@@ -496,7 +690,7 @@ async fn scrape_handler(
             .await
             .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ページを開けませんでした: {}", e)))?;
 
-        let effective_cookie = params.pixiv_cookie.as_ref().or(state.pixiv_phpsessid.as_ref());
+        let effective_cookie = params.twitter_cookie.as_ref().or(state.twitter_auth_token.as_ref());
         if let Some(token) = effective_cookie {
             // .x.com と .twitter.com の両方に auth_token をセット
             for domain in [".x.com", ".twitter.com"] {
@@ -518,61 +712,115 @@ async fn scrape_handler(
         tokio::time::sleep(Duration::from_millis(1500)).await;
         page
     } else {
-        state
+        let page = state
             .browser
             .new_page(base_url.as_str())
             .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ページを開けませんでした: {}", e)))?
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ページを開けませんでした: {}", e)))?;
+        // 動的サイト（SPA・React/Vue等）の初期DOMレンダリング待機
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        page
     };
 
     // 3. pixiv等の「すべて見る」・漫画サイトの「チャプターを見る」展開 ＆ 全自動深層スクロール
     let expand_and_scroll_script = r#"
         (async () => {
-            // 「チャプターを見る」「すべて見る」等の展開ボタンをすべて自動クリック
-            const buttons = Array.from(document.querySelectorAll('button, [role="button"], a, div, span, .read-more, .load-more'));
-            for (const btn of buttons) {
-                const text = (btn.innerText || btn.textContent || '').trim();
-                if (
-                    text.includes('チャプターを見る') ||
-                    text.includes('チャプター') ||
-                    text.includes('すべて見る') ||
-                    text.includes('もっと見る') ||
-                    text.includes('See all') ||
-                    text.includes('続きを読む') ||
-                    text.includes('Load') ||
-                    text.includes('Read')
-                ) {
-                    try { btn.click(); } catch(e) {}
+            // マウスイベント（mousedown/mouseup/click）をシミュレートして確実に発火
+            const clickElement = (el) => {
+                try {
+                    el.scrollIntoView({ block: 'center', inline: 'center' });
+                    const events = ['mouseenter', 'mouseover', 'mousedown', 'mouseup', 'click'];
+                    for (const ev of events) {
+                        el.dispatchEvent(new MouseEvent(ev, {
+                            bubbles: true,
+                            cancelable: true,
+                            view: window,
+                            buttons: 1
+                        }));
+                    }
+                    if (typeof el.click === 'function') {
+                        el.click();
+                    }
+                } catch(e) {}
+            };
+
+            // 最も深い子要素（親ラッパー要素への誤クリックを防止）を特定してクリック
+            const candidateElements = Array.from(document.querySelectorAll('button, [role="button"], a, input[type="button"], input[type="submit"], div, span, p, .read-more, .load-more'));
+            for (const el of candidateElements) {
+                const text = (el.innerText || el.textContent || '').trim();
+                // ページ全体のコンテナ誤爆を防ぐため長文要素は除外
+                if (!text || text.length > 50) continue;
+
+                const isTarget = [
+                    'チャプターを見る',
+                    'チャプター',
+                    'すべて見る',
+                    'もっと見る',
+                    'See all',
+                    '続きを読む',
+                    'Load all',
+                    'Read now',
+                    'View all'
+                ].some(keyword => text.includes(keyword));
+
+                if (isTarget) {
+                    // 直下に同一キーワードを持つ子要素がある場合は子要素側をクリックさせる
+                    const hasChildTarget = Array.from(el.children).some(child => {
+                        const childText = (child.innerText || child.textContent || '').trim();
+                        return childText.includes('チャプター') || childText.includes('見る') || childText.includes('See') || childText.includes('Read');
+                    });
+
+                    if (!hasChildTarget) {
+                        clickElement(el);
+                    }
                 }
             }
 
-            // クリック後に画像がDOMに読み込まれるまで待機
-            await new Promise(r => setTimeout(r, 600));
+            // クリック後の非同期通信待ちを 1.2 秒に最適化
+            await new Promise(r => setTimeout(r, 1200));
 
-            // Renderの低CPUでもフリーズしないよう高速・大股スクロール（全自動走査）
+            // window だけでなく内部のスクロール可能コンテナも検出
+            const scrollableElements = [window];
+            document.querySelectorAll('div, section, main, article').forEach(elem => {
+                if (elem.scrollHeight > elem.clientHeight + 100) {
+                    const overflow = window.getComputedStyle(elem).overflowY;
+                    if (overflow === 'auto' || overflow === 'scroll') {
+                        scrollableElements.push(elem);
+                    }
+                }
+            });
+
+            // スクロール速度を大幅に高速化（間隔を40msに半減、移動距離を1500pxに拡大）
             await new Promise((resolve) => {
-                let totalHeight = 0;
-                const distance = 1200; // 一気にスクロールして高速化
                 let steps = 0;
-                const maxSteps = 25;
+                const maxSteps = 30;
+                const distance = 1500;
                 const timer = setInterval(() => {
-                    const scrollHeight = document.body.scrollHeight;
-                    window.scrollBy(0, distance);
-                    totalHeight += distance;
+                    for (const target of scrollableElements) {
+                        if (target === window) {
+                            window.scrollBy(0, distance);
+                        } else {
+                            target.scrollTop += distance;
+                        }
+                    }
                     steps++;
 
-                    if (totalHeight >= scrollHeight || steps >= maxSteps) {
+                    const scrollHeight = document.body.scrollHeight;
+                    const currentScroll = window.scrollY + window.innerHeight;
+
+                    if ((currentScroll >= scrollHeight && steps >= 6) || steps >= maxSteps) {
                         clearInterval(timer);
-                        window.scrollTo(0, 0);
                         resolve();
                     }
-                }, 60);
+                }, 40);
             });
+
+            // DOM確定待機を 400ms に最適化
+            await new Promise(r => setTimeout(r, 400));
         })()
     "#;
     let _ = page.evaluate(expand_and_scroll_script).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-
     // 4. JavaScript実行・描画完了後の完全なDOM HTMLを取得（エラー時も確実にタブを閉じてメモリ解放）
     let html_content_result = page.content().await;
     let _ = page.close().await;
@@ -678,6 +926,10 @@ async fn scrape_handler(
         "data-full-url",
         "data-url",
         "data-cfsrc",
+        "data-img",
+        "data-origin",
+        "data-source",
+        "data-echo",
         "src",
     ];
     for element in document.select(&IMG_SELECTOR) {
@@ -765,22 +1017,21 @@ async fn scrape_handler(
     // 動画取得 (<video>, <source>, <meta og:video>, <iframe>, 主要動画サイトリンク)
     let mut videos = Vec::new();
 
-    // 広告・トラッキングURLを除外する判定クロージャ
+    // 広告・トラッキングURLを除外する判定クロージャ（正規動画URLの誤除外を防ぐためドメイン・確定パスベースで判定）
     let is_ad_or_junk = |u: &str| -> bool {
         let lower = u.to_lowercase();
-        lower.contains("doubleclick")
-            || lower.contains("googlesyndication")
-            || lower.contains("trafficfactory")
-            || lower.contains("exoclick")
-            || lower.contains("juicyads")
-            || lower.contains("adsterra")
-            || lower.contains("popcash")
-            || lower.contains("tsyndicate")
-            || lower.contains("ero-advertising")
-            || lower.contains("/ad/")
-            || lower.contains("/ads/")
-            || lower.contains("banner")
-            || lower.contains("creative")
+        lower.contains("doubleclick.net")
+            || lower.contains("googlesyndication.com")
+            || lower.contains("trafficfactory.biz")
+            || lower.contains("exoclick.com")
+            || lower.contains("juicyads.com")
+            || lower.contains("adsterra.com")
+            || lower.contains("popcash.net")
+            || lower.contains("tsyndicate.com")
+            || lower.contains("ero-advertising.com")
+            || lower.contains("/pagead/")
+            || lower.contains("/adv/")
+            || lower.contains("/ad-server/")
     };
 
     // 1. <video> / <source> タグ（広告URLは除外）
@@ -894,10 +1145,14 @@ async fn scrape_handler(
                     }
                 }
             }
-            // 動画直リンク または 主要動画サイト（YouTube, ニコニコ, Pornhub等）
+            // 動画直リンク または 主要動画サイト（YouTube, ニコニコ, TikTok, Threads, 各種動画サイト等）
             let is_video_site = lower.contains("youtube.com/watch")
                 || lower.contains("youtu.be/")
                 || lower.contains("nicovideo.jp/watch")
+                || lower.contains("tiktok.com/")
+                || lower.contains("threads.net/")
+                || lower.contains("instagram.com/reel/")
+                || lower.contains("instagram.com/p/")
                 || lower.contains("pornhub.com/view_video.php")
                 || lower.contains("xvideos.com/video")
                 || lower.contains("missav.")
@@ -960,6 +1215,10 @@ async fn scrape_handler(
         || base_lower.contains("youtube.com")
         || base_lower.contains("youtu.be")
         || base_lower.contains("nicovideo.jp/watch")
+        || base_lower.contains("tiktok.com/")
+        || base_lower.contains("threads.net/")
+        || base_lower.contains("instagram.com/reel/")
+        || base_lower.contains("instagram.com/p/")
         || base_lower.contains("pornhub.com/view_video.php")
         || base_lower.contains("xvideos.com/video")
         || (base_lower.contains("twitter.com") && base_lower.contains("/status/"))
@@ -989,9 +1248,19 @@ struct DownloadParams {
 
 // その動画で利用可能な実際の解像度一覧（例: [2160, 1080, 720, 480, 360]）を取得するハンドラ
 async fn video_formats_handler(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
     Query(params): Query<DownloadParams>,
 ) -> Result<Json<Vec<u32>>, (StatusCode, String)> {
+    if !state.check_rate_limit(addr.ip()).await {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "短時間にリクエストが多すぎます。1分ほど待ってから再試行してください。".to_string(),
+        ));
+    }
+
     let mut cmd = Command::new("yt-dlp");
+    cmd.kill_on_drop(true); // タイムアウト時にOS側の子プロセスを確実に強制終了
     cmd.arg("-J").arg("--no-playlist").arg("--no-warnings").arg("--no-update").arg("--").arg(&params.url);
 
     let output = tokio::time::timeout(Duration::from_secs(15), cmd.output())
@@ -1024,8 +1293,18 @@ async fn video_formats_handler(
 
 // yt-dlp を使ってブラウザ経由でダウンロードさせる処理
 async fn download_handler(
+    State(state): State<AppState>,
     Query(params): Query<DownloadParams>,
 ) -> Result<Response, (StatusCode, String)> {
+    // 同時ダウンロード数制限：空きがない場合は混雑エラー
+    let _permit = match tokio::time::timeout(Duration::from_secs(5), state.download_semaphore.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        _ => return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ダウンロード処理が混み合っています。数分後に再度お試しください。".to_string(),
+        )),
+    };
+
     // リクエストごとにユニークな一時ディレクトリを作成（衝突回避とクリーンアップ用）
     let temp_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1057,6 +1336,7 @@ async fn download_handler(
 
     // yt-dlp コマンドを構築
     let mut cmd = Command::new("yt-dlp");
+    cmd.kill_on_drop(true); // タイムアウトやクライアント切断時に確実に子プロセスを強制終了
     cmd.arg("-P").arg(&temp_dir);
     cmd.arg("-o").arg("%(title)s.%(ext)s");
     cmd.arg("--no-playlist");
@@ -1131,7 +1411,7 @@ async fn download_handler(
         return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("yt-dlp実行エラー:\n{}", err_msg)));
     }
 
-    // 生成されたファイルを取得（.part 等の一時ファイルを除外して探索）
+    // 生成されたメディアファイルを取得（画像サムネイルや中間ファイルを除外し、動画・音声拡張子を優先探索）
     let mut dir_entries = tokio::fs::read_dir(&temp_dir)
         .await
         .map_err(|e| {
@@ -1139,12 +1419,18 @@ async fn download_handler(
             (StatusCode::INTERNAL_SERVER_ERROR, format!("フォルダ読み取り失敗: {}", e))
         })?;
 
+    let valid_extensions = ["mp4", "webm", "mkv", "mp3", "m4a", "wav", "flac", "ogg", "aac"];
     let mut found_file = None;
+
     while let Ok(Some(entry)) = dir_entries.next_entry().await {
         let path = entry.path();
         if path.is_file() {
-            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            if ext != "part" && ext != "temp" && ext != "ytdl" {
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if valid_extensions.contains(&ext.as_str()) {
                 found_file = Some(path);
                 break;
             }
@@ -1177,36 +1463,47 @@ async fn download_handler(
         "m4a" => "audio/mp4",
         "wav" => "audio/wav",
         "webm" => "video/webm",
+        "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
         _ => "video/mp4",
     };
 
-    // ファイルの中身を読み込む（エラー時も確実に一時フォルダを削除）
-    let file_bytes = match tokio::fs::read(&downloaded_file).await {
-        Ok(bytes) => bytes,
+    // ファイルをストリーミング用に開く（低メモリ環境でのOOMクラッシュ防止）
+    let file = match tokio::fs::File::open(&downloaded_file).await {
+        Ok(f) => f,
         Err(e) => {
             let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("ファイル読み込み失敗: {}", e)));
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("ファイルオープン失敗: {}", e)));
         }
     };
-
-    // 読み込み終わった一時フォルダをサーバーから削除して容量解放
-    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 
     // 送信用ヘッダー構築
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
 
-    // 日本語ファイル名の文字化け防止 (RFC 5987 / RFC 6266 標準準拠)
-    // filename にはASCII互換名、filename* にUTF-8エンコード名を渡す
-    let encoded_filename: String = url::form_urlencoded::byte_serialize(filename.as_bytes()).collect();
+    // 日本語ファイル名の文字化け防止 (RFC 5987 / RFC 6266 標準準拠: スペースを%20でエンコード)
+    let encoded_filename: String = url::form_urlencoded::byte_serialize(filename.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20");
     let ascii_safe_filename = filename.replace(|c: char| !c.is_ascii() || c == '"' || c == '\\', "_");
     let disposition_val = format!("attachment; filename=\"{}\"; filename*=UTF-8''{}", ascii_safe_filename, encoded_filename);
     if let Ok(val) = HeaderValue::from_str(&disposition_val) {
         headers.insert(header::CONTENT_DISPOSITION, val);
     }
 
-    // ブラウザにバイナリデータを返却
-    Ok((headers, file_bytes).into_response())
+    // ストリームを生成してレスポンス（バックグラウンドクリーンアップタスク付き）
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = axum::body::Body::from_stream(stream);
+
+    // 送信完了後にフォルダを削除するガードタスク
+    // ※ エフェメラル環境でのディスク枯渇を防ぐため15分後に自動クリーンアップ
+    let temp_dir_cleanup = temp_dir.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(900)).await;
+        let _ = tokio::fs::remove_dir_all(&temp_dir_cleanup).await;
+    });
+
+    Ok((headers, body).into_response())
 }
 
 // 外部画像・メディアダウンロード時のCORS制約を回避するプロキシハンドラ
@@ -1217,22 +1514,59 @@ async fn proxy_handler(
     let parsed_url = Url::parse(&params.url)
         .map_err(|_| (StatusCode::BAD_REQUEST, "無効な URL です。".to_string()))?;
 
-    // blob: や data: など http/https 以外の不正スキームを即座に拒否して502エラーを防ぐ
+    // blob: や data: など http/https 以外の不正スキームを即座に拒否して 502エラーを防ぐ
     if parsed_url.scheme() != "http" && parsed_url.scheme() != "https" {
         return Err((StatusCode::BAD_REQUEST, "httpまたはhttpsのURLのみ指定可能です（blob:や一時URLはプロキシできません）。".to_string()));
     }
 
-    // 403 Forbidden 回避用：URLに応じた適切な Referer（参照元）ヘッダーを自動生成
-    let mut req_builder = state.client.get(parsed_url.as_str());
+    // SSRF対策：localhost やプライベートIP（10.x, 172.16-31.x, 192.168.x）、リンクローカル、0.0.0.0 へのリクエストを厳格に遮断
+    if let Some(host) = parsed_url.host_str() {
+        let host_lower = host.trim_matches(|c| c == '[' || c == ']').to_lowercase();
+        let is_private_172 = if host_lower.starts_with("172.") {
+            host_lower.split('.').nth(1)
+                .and_then(|octet| octet.parse::<u8>().ok())
+                .map(|val| (16..=31).contains(&val))
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if host_lower == "localhost"
+            || host_lower == "0.0.0.0"
+            || host_lower.starts_with("127.")
+            || host_lower.starts_with("10.")
+            || host_lower.starts_with("192.168.")
+            || host_lower.starts_with("169.254.")
+            || is_private_172
+            || host_lower == "::1"
+            || host_lower == "::"
+            || host_lower.starts_with("fc00:")
+            || host_lower.starts_with("fe80:")
+        {
+            return Err((StatusCode::FORBIDDEN, "ローカルアドレスへのプロキシは許可されていません。".to_string()));
+        }
+    }
+
+    // 403 Forbidden 回避用：URLに応じた適切な Referer（参照元）ヘッダーとブラウザ標準ヘッダーを自動生成
+    let mut req_builder = state.client.get(parsed_url.as_str())
+        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+        .header(reqwest::header::ACCEPT, "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+        .header("sec-ch-ua", "\"Chromium\";v=\"122\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"122\"")
+        .header("sec-ch-ua-mobile", "?0")
+        .header("sec-ch-ua-platform", "\"Windows\"")
+        .header("sec-fetch-dest", "image")
+        .header("sec-fetch-mode", "no-cors")
+        .header("sec-fetch-site", "cross-site");
 
     let host = parsed_url.host_str().unwrap_or("");
-    if let Some(ref ref_url) = params.referer {
-        // 親ページのURLが指定されている場合はそれを最優先（漫画サイトCDN等に有効）
-        req_builder = req_builder.header(reqwest::header::REFERER, ref_url.as_str());
-    } else if host.contains("pximg.net") || host.contains("pixiv") {
+    // pximg.net (Pixiv) は外部サイトのリファラを拒否するため最優先で固定
+    if host.contains("pximg.net") || host.contains("pixiv") {
         req_builder = req_builder.header(reqwest::header::REFERER, "https://www.pixiv.net/");
     } else if host.contains("twimg.com") || host.contains("twitter") || host.contains("x.com") {
         req_builder = req_builder.header(reqwest::header::REFERER, "https://x.com/");
+    } else if let Some(ref ref_url) = params.referer {
+        // その他一般CDN向け：親ページURLを優先
+        req_builder = req_builder.header(reqwest::header::REFERER, ref_url.as_str());
     } else {
         // 一般サイト向け：その画像のオリジンをリファラとして設定
         let origin = format!("{}://{}", parsed_url.scheme(), host);
@@ -1254,9 +1588,9 @@ async fn proxy_handler(
     // サーバーが汎用バイナリ(octet-stream)等を返してきた場合、URLの拡張子から画像MIMEタイプを自動補正
     if content_type == "application/octet-stream" || content_type.is_empty() {
         let path_lower = parsed_url.path().to_lowercase();
-        if path_lower.ends_with(".jpg") || path_lower.ends_with(".jpeg") {
+        if path_lower.ends_with(".jpg") || path_lower.ends_with(".jpeg") || path_lower.contains("@jpeg") || path_lower.contains("@jpg") {
             content_type = "image/jpeg".to_string();
-        } else if path_lower.ends_with(".png") {
+        } else if path_lower.ends_with(".png") || path_lower.contains("@png") {
             content_type = "image/png".to_string();
         } else if path_lower.ends_with(".webp") {
             content_type = "image/webp".to_string();
@@ -1274,18 +1608,46 @@ async fn proxy_handler(
         headers.insert(header::CONTENT_TYPE, ct);
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // メモリに一括展開せずストリーミング転送（数GBの動画中継でもRAM消費はわずか数KB）
+    let stream = response.bytes_stream();
+    let body = axum::body::Body::from_stream(stream);
 
-    Ok((headers, bytes).into_response())
+    Ok((headers, body).into_response())
 }
 
 // ページ全体をフォント完全保持でPDF出力するハンドラ
 async fn pdf_handler(
     State(state): State<AppState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
     Query(params): Query<ScrapeParams>,
+) -> Result<Response, (StatusCode, String)> {
+    if !state.check_rate_limit(addr.ip()).await {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "短時間にリクエストが多すぎます。1分ほど待ってから再試行してください。".to_string(),
+        ));
+    }
+
+    // 同時実行制限：ブラウザの同時起動数を制限
+    let _permit = match tokio::time::timeout(Duration::from_secs(5), state.browser_semaphore.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        _ => return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "現在アクセスが集中しています。恐れ入りますが、数十秒ほど待ってから再度お試しください。".to_string(),
+        )),
+    };
+
+    // 30秒のタイムアウトを設定してハングを防止
+    let pdf_future = do_pdf(state.clone(), params);
+    match tokio::time::timeout(Duration::from_secs(30), pdf_future).await {
+        Ok(result) => result,
+        Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, "PDF生成がタイムアウトしました（30秒）。ページが重すぎるかアクセスが遮断された可能性があります。".to_string())),
+    }
+}
+
+async fn do_pdf(
+    state: AppState,
+    params: ScrapeParams,
 ) -> Result<Response, (StatusCode, String)> {
     let base_url = Url::parse(&params.url)
         .map_err(|_| (StatusCode::BAD_REQUEST, "無効なURLです。".to_string()))?;
@@ -1294,11 +1656,63 @@ async fn pdf_handler(
         return Err((StatusCode::BAD_REQUEST, "http または https のURLを指定してください。".to_string()));
     }
 
-    let page = state
-        .browser
-        .new_page(base_url.as_str())
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ページを開けませんでした: {}", e)))?;
+    let page_host = base_url.host_str().unwrap_or("");
+    let is_pixiv = page_host.contains("pixiv.net");
+    let is_twitter = page_host.contains("twitter.com") || page_host.contains("x.com");
+
+    let page = if is_pixiv || is_twitter {
+        let page = state
+            .browser
+            .new_page("about:blank")
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ページを開けませんでした: {}", e)))?;
+
+        if is_pixiv {
+            let effective_phpsessid = params.pixiv_cookie.as_ref().or(state.pixiv_phpsessid.as_ref());
+            if let Some(phpsessid) = effective_phpsessid {
+                let cookie_params = chromiumoxide::cdp::browser_protocol::network::SetCookieParams::builder()
+                    .name("PHPSESSID")
+                    .value(phpsessid.clone())
+                    .domain(".pixiv.net")
+                    .path("/")
+                    .http_only(true)
+                    .secure(true)
+                    .build();
+                if let Ok(p_cookie) = cookie_params {
+                    let _ = page.execute(p_cookie).await;
+                }
+            }
+        } else if is_twitter {
+            let effective_cookie = params.twitter_cookie.as_ref().or(state.twitter_auth_token.as_ref());
+            if let Some(token) = effective_cookie {
+                for domain in [".x.com", ".twitter.com"] {
+                    let cookie_params = chromiumoxide::cdp::browser_protocol::network::SetCookieParams::builder()
+                        .name("auth_token")
+                        .value(token.clone())
+                        .domain(domain)
+                        .path("/")
+                        .http_only(true)
+                        .secure(true)
+                        .build();
+                    if let Ok(p) = cookie_params {
+                        let _ = page.execute(p).await;
+                    }
+                }
+            }
+        }
+
+        let _ = page.goto(base_url.as_str()).await;
+        page
+    } else {
+        state
+            .browser
+            .new_page(base_url.as_str())
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ページを開けませんでした: {}", e)))?
+    };
+
+    // 動的コンテンツの初期レンダリング待機
+    tokio::time::sleep(Duration::from_millis(1500)).await;
 
     // PDF生成前にも自動展開＆スクロールを行い、LazyLoad画像や隠し要素を読み込ませる
     let expand_script = r#"
@@ -1328,6 +1742,7 @@ async fn pdf_handler(
         .build();
 
     let pdf_bytes_result = page.pdf(pdf_options).await;
+    // PDF生成の成否にかかわらず確実にタブを閉じてメモリ解放
     let _ = page.close().await;
 
     let pdf_bytes = match pdf_bytes_result {
@@ -1338,7 +1753,7 @@ async fn pdf_handler(
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/pdf"));
     let disposition_val = "attachment; filename=\"page.pdf\"; filename*=UTF-8''page.pdf";
-    if let Ok(val) = HeaderValue::from_str(disposition_val) {
+    if let Ok(val) = HeaderValue::from_str(&disposition_val) {
         headers.insert(header::CONTENT_DISPOSITION, val);
     }
 

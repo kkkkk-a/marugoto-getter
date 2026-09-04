@@ -5,7 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>まるごとゲッター</title>
   <link rel="icon" href="/favicon.ico">
+  <!-- ZIP作成ライブラリ -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <!-- 複数画像PDF結合ライブラリ -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <!-- AA（アスキーアート）を Mac / スマホでも崩さず再現するWebフォント -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/sunfish-shogi/saitamaar/dist/saitamaar.css">
+  <!-- HLS (.m3u8) 動画ストリームを直接再生するためのライブラリ -->
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
   <style>
     body { font-family: sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; }
     .input-group { display: flex; gap: 10px; margin-bottom: 20px; }
@@ -35,10 +42,12 @@
 
     .image-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 15px; margin-top: 10px; }
     .image-card { position: relative; border: 1px solid #ddd; border-radius: 6px; overflow: hidden; background: #fff; }
-    .image-card img { width: 100%; height: 140px; object-fit: cover; display: block; }
+    .image-card img { width: 100%; height: 140px; object-fit: cover; display: block; cursor: pointer; transition: transform 0.2s; }
+    .image-card img:hover { transform: scale(1.03); }
     .image-card input[type="checkbox"] { position: absolute; top: 8px; left: 8px; transform: scale(1.4); cursor: pointer; z-index: 2; }
     .image-card .size-badge { position: absolute; bottom: 4px; right: 4px; background: rgba(0,0,0,0.6); color: #fff; font-size: 10px; padding: 2px 4px; border-radius: 3px; }
-    /* AA（アスキーアート）専用設定：OS標準の等幅・互換フォント */
+
+    /* AA（アスキーアート）専用設定：Webフォントと等幅フォント */
     .text-box { 
       background: #fdfdfd; 
       padding: 15px; 
@@ -46,16 +55,79 @@
       border: 1px solid #ddd; 
       max-height: 500px; 
       overflow: auto; 
-      font-family: 'MS PGothic', 'MS Pゴシック', 'IPAMonaPGothic', 'Mona', 'Hiragino Kaku Gothic ProN', sans-serif; 
+      font-family: 'Saitamaar', 'MS PGothic', 'MS Pゴシック', 'IPAMonaPGothic', 'Mona', 'Textar', 'Hiragino Kaku Gothic ProN', sans-serif; 
       font-size: 16px; 
       line-height: 18px; 
       white-space: pre; 
       letter-spacing: 0;
     }
-    .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 15px; margin-top: 10px; }
+    
+    /* minmaxを280pxに設定しスマホ画面でもはみ出さないように最適化 */
+    .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 15px; margin-top: 10px; }
     .video-card { background: #f5f5f5; border-radius: 8px; padding: 10px; border: 1px solid #ddd; }
     .video-card video, .video-card iframe { width: 100%; height: 200px; border-radius: 6px; border: none; background: #000; display: block; }
     .loading { display: none; color: #666; font-weight: bold; margin-top: 10px; }
+
+    /* 画像アプリ風ギャラリーモーダル */
+    .image-modal-overlay {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0, 0, 0, 0.9);
+      z-index: 9999;
+      justify-content: center;
+      align-items: center;
+      padding: 20px;
+      box-sizing: border-box;
+      user-select: none;
+    }
+    .image-modal-overlay.active { display: flex; }
+    .image-modal-content {
+      max-width: 85vw;
+      max-height: 85vh;
+      object-fit: contain;
+      border-radius: 6px;
+      box-shadow: 0 5px 25px rgba(0,0,0,0.7);
+    }
+    .image-modal-close {
+      position: absolute;
+      top: 15px;
+      right: 20px;
+      color: #fff;
+      font-size: 36px;
+      font-weight: bold;
+      cursor: pointer;
+      z-index: 10001;
+    }
+    .image-modal-nav {
+      position: absolute;
+      top: 50%;
+      transform: translateY(-50%);
+      background: rgba(255, 255, 255, 0.15);
+      color: #fff;
+      font-size: 28px;
+      padding: 16px 14px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.2s;
+      z-index: 10000;
+    }
+    .image-modal-nav:hover { background: rgba(255, 255, 255, 0.35); }
+    .image-modal-nav.prev { left: 20px; }
+    .image-modal-nav.next { right: 20px; }
+    .image-modal-counter {
+      position: absolute;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #eee;
+      background: rgba(0, 0, 0, 0.6);
+      padding: 6px 16px;
+      border-radius: 20px;
+      font-size: 14px;
+      letter-spacing: 1px;
+    }
   </style>
 </head>
 <body>
@@ -97,7 +169,7 @@
 
       <div style="font-size:12px; color:#475569; background:#f1f5f9; padding:10px; border-radius:5px; border-left:3px solid #0288d1; margin-top:8px;">
         <div style="margin-bottom:4px;">
-          🔒 <strong>安全性:</strong> 入力されたCookieはご自身のパソコンの <strong>LocalStorage</strong> にのみ保存され、外部サーバーへ送信・漏洩することはありません。
+          🔒 <strong>安全性:</strong> CookieはブラウザのLocalStorageに保存され、スクレイピング実行時のみバックエンドサーバーへ安全に送信されます（第三者への送信・漏洩はありません）。
         </div>
         <div>
           🔄 <strong>更新タイミング:</strong> 基本的に長期間有効ですが、ブラウザ側でログアウトした際やパスワード変更時は再度貼り直してください。
@@ -105,10 +177,19 @@
       </div>
     </div>
 
-    <div style="display:flex; gap:8px;">
-      <input type="password" id="pixivCookieInput" placeholder="Pixiv用 PHPSESSID または X用 auth_token を貼り付け" style="flex:1; padding:10px; font-size:13px; border:1px solid #cbd5e1; border-radius:4px; font-family:monospace;">
-      <button type="button" onclick="savePixivCookie()" style="background:#0288d1; color:#fff; border:none; padding:10px 18px; font-size:13px; border-radius:4px; cursor:pointer; font-weight:bold;">保存する</button>
-      <button type="button" onclick="clearPixivCookie()" style="background:#64748b; color:#fff; border:none; padding:10px 14px; font-size:13px; border-radius:4px; cursor:pointer;">削除</button>
+    <div style="display:flex; flex-direction:column; gap:10px;">
+      <div style="display:flex; gap:8px; align-items:center;">
+        <span style="font-size:13px; font-weight:bold; width:120px; color:#334155;">Pixiv Cookie:</span>
+        <input type="password" id="pixivCookieInput" placeholder="PHPSESSID の値を貼り付け" style="flex:1; padding:8px 10px; font-size:13px; border:1px solid #cbd5e1; border-radius:4px; font-family:monospace;">
+      </div>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <span style="font-size:13px; font-weight:bold; width:120px; color:#334155;">X / Twitter:</span>
+        <input type="password" id="twitterCookieInput" placeholder="auth_token の値を貼り付け" style="flex:1; padding:8px 10px; font-size:13px; border:1px solid #cbd5e1; border-radius:4px; font-family:monospace;">
+      </div>
+      <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:5px;">
+        <button type="button" onclick="saveCookies()" style="background:#0288d1; color:#fff; border:none; padding:8px 16px; font-size:13px; border-radius:4px; cursor:pointer; font-weight:bold;">Cookieを保存する</button>
+        <button type="button" onclick="clearCookies()" style="background:#64748b; color:#fff; border:none; padding:8px 12px; font-size:13px; border-radius:4px; cursor:pointer;">すべてクリア</button>
+      </div>
     </div>
   </div>
 
@@ -121,7 +202,7 @@
     <!-- 画像セクション -->
     <div class="result-section" id="imageSection">
       <div class="section-header" onclick="toggleSection('imageSection')">
-        <h3>🖼️ 取得した画像 (<span id="imgCount">0</span>件)</h3>
+        <h3>🖼️ 取得した画像 (<span id="imgCount">0</span>件 / 選択中: <span id="selectedImgCount" style="color:#e44d26; font-weight:bold;">0</span>件)</h3>
         <span class="toggle-icon">▼</span>
       </div>
       <div class="section-body">
@@ -143,13 +224,15 @@
                 <option value="jpeg">JPG (.jpg)</option>
                 <option value="png">PNG (.png)</option>
                 <option value="webp">WebP (.webp)</option>
+                <option value="cbz">📚 CBZ (コミック・電子書籍)</option>
               </select>
             </div>
           </div>
           <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
             <button type="button" onclick="toggleSelectAll(true)" style="background:#555; padding:6px 12px; font-size:13px;">全選択</button>
             <button type="button" onclick="toggleSelectAll(false)" style="background:#777; padding:6px 12px; font-size:13px;">全解除</button>
-            <button id="downloadZipBtn" onclick="downloadSelectedImagesAsZip(this)" style="background-color: #e44d26; padding:6px 15px; font-size:14px; font-weight:bold;">📦 ZIPで一括保存</button>
+            <button id="downloadZipBtn" onclick="downloadSelectedImagesAsZip(this)" style="background-color: #e44d26; padding:6px 15px; font-size:14px; font-weight:bold;">📦 ZIP/CBZ保存</button>
+            <button id="downloadPdfBookBtn" onclick="downloadSelectedImagesAsPdfBook(this)" style="background-color: #0288d1; padding:6px 15px; font-size:14px; font-weight:bold;">📑 PDF結合保存</button>
             <button id="downloadSelectedBtn" onclick="downloadSelectedImages(this)" style="background-color: #2e7d32; padding:6px 15px; font-size:14px;">💾 個別保存</button>
           </div>
         </div>
@@ -199,10 +282,88 @@
     </div>
   </div>
 
+  <!-- 画像アプリ風ギャラリーモーダル -->
+  <div id="imageModal" class="image-modal-overlay" onclick="closeImageModal(event)">
+    <span class="image-modal-close" onclick="closeImageModal(event)">&times;</span>
+    <button type="button" class="image-modal-nav prev" onclick="navigateModalImage(-1, event)">&#10094;</button>
+    <img id="imageModalImg" class="image-modal-content" src="" alt="プレビュー">
+    <button type="button" class="image-modal-nav next" onclick="navigateModalImage(1, event)">&#10095;</button>
+    <div id="imageModalCounter" class="image-modal-counter">1 / 1</div>
+  </div>
+
+  <!-- 一般公開用 フッター免責事項 -->
+  <footer style="margin-top: 60px; padding: 20px 10px; border-top: 1px solid #e2e8f0; font-size: 11px; color: #64748b; line-height: 1.7; text-align: center;">
+    <p style="margin: 0 0 6px 0;">
+      🔒 <strong>利用規約・免責事項:</strong> 本ツールは個人による私的使用（著作権法第30条）の範囲内でのみご利用ください。
+    </p>
+    <p style="margin: 0;">
+      権利者の許諾なくインターネット上へ再配布・転載する行為や、違法にアップロードされたコンテンツのダウンロードはお控えください。本ツールの利用により生じた損害等について当サイトは一切の責任を負いかねます。
+    </p>
+  </footer>
+
   <script>
     let currentParagraphs = [];
     let currentTitle = "scraped_data";
     let currentScrapedUrl = ""; // スクレイピング成功時のURLを保持
+    let currentVisibleImageSources = []; // プレビュー用の表示中画像URL一覧
+    let currentModalImageIndex = 0;      // 現在表示中のインデックス
+
+    // ギャラリーモーダルを開く
+    function openImageModalByElement(targetImg) {
+      const visibleCards = Array.from(document.querySelectorAll('.image-card:not([style*="display: none"]) img'));
+      currentVisibleImageSources = visibleCards.map(img => img.src);
+      if (currentVisibleImageSources.length === 0) return;
+
+      const foundIndex = visibleCards.indexOf(targetImg);
+      currentModalImageIndex = foundIndex !== -1 ? foundIndex : 0;
+      updateModalImage();
+
+      const modal = document.getElementById('imageModal');
+      modal.classList.add('active');
+    }
+
+    // 画像とカウンターの更新
+    function updateModalImage() {
+      const modalImg = document.getElementById('imageModalImg');
+      const counter = document.getElementById('imageModalCounter');
+      modalImg.src = currentVisibleImageSources[currentModalImageIndex];
+      counter.innerText = `${currentModalImageIndex + 1} / ${currentVisibleImageSources.length}`;
+    }
+
+    // 前後へ移動（方向: -1 または 1）
+    function navigateModalImage(direction, e) {
+      if (e) e.stopPropagation();
+      if (currentVisibleImageSources.length <= 1) return;
+
+      currentModalImageIndex = (currentModalImageIndex + direction + currentVisibleImageSources.length) % currentVisibleImageSources.length;
+      updateModalImage();
+    }
+
+    function closeImageModal(e) {
+      if (e.target.id === 'imageModal' || e.target.classList.contains('image-modal-close')) {
+        const modal = document.getElementById('imageModal');
+        modal.classList.remove('active');
+        document.getElementById('imageModalImg').src = '';
+      }
+    }
+
+    // キーボード操作：左右矢印キー（← / →）で画像切り替え、ESCキーで閉じる
+    window.addEventListener('keydown', (e) => {
+      const modal = document.getElementById('imageModal');
+      if (!modal || !modal.classList.contains('active')) return;
+
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        navigateModalImage(-1);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        navigateModalImage(1);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        modal.classList.remove('active');
+        document.getElementById('imageModalImg').src = '';
+      }
+    });
 
     // XSS対策用エスケープ関数
     function escapeHtml(str) {
@@ -224,12 +385,19 @@
     }
 
     function toggleSelectAll(checked) {
-      document.querySelectorAll('.image-card:not([style*="display: none"]) .img-select-check').forEach(cb => cb.checked = checked);
+      document.querySelectorAll('.image-card').forEach(card => {
+        if (card.style.display !== 'none') {
+          const cb = card.querySelector('.img-select-check');
+          if (cb) {
+            cb.checked = checked;
+          }
+        }
+      });
+      updateVisibleCount();
     }
 
     // MIMEタイプ(Content-Type)またはURLから100%正確に拡張子を特定する強化版ヘルパー関数
     function detectImageExtension(urlStr, blobType = '', defaultExt = 'jpg') {
-      // 1. サーバーから返ってきた実際のBlobタイプを最優先で判定
       if (blobType) {
         const mime = blobType.toLowerCase();
         if (mime.includes('image/png')) return 'png';
@@ -238,7 +406,6 @@
         if (mime.includes('image/gif')) return 'gif';
         if (mime.includes('image/avif')) return 'avif';
         if (mime.includes('image/svg')) return 'svg';
-        // 動画・音声 MIME判定を追加
         if (mime.includes('audio/mpeg') || mime.includes('audio/mp3')) return 'mp3';
         if (mime.includes('audio/wav')) return 'wav';
         if (mime.includes('audio/mp4') || mime.includes('audio/m4a') || mime.includes('audio/aac')) return 'm4a';
@@ -248,7 +415,6 @@
         if (mime.includes('video/mp4')) return 'mp4';
       }
 
-      // 2. Twitter等のURLクエリパラメータ (?format=png など) を判定
       try {
         const parsed = new URL(urlStr, location.href);
         const formatParam = parsed.searchParams.get('format');
@@ -259,7 +425,6 @@
           }
         }
 
-        // 3. 通常のURLパス末尾の拡張子を判定
         const pathname = parsed.pathname;
         const lastPart = pathname.substring(pathname.lastIndexOf('/') + 1);
         if (lastPart.includes('.')) {
@@ -286,7 +451,6 @@
           throw new Error(errText);
         }
 
-        // レスポンスヘッダーからファイル名を取得（RFC 5987 / UTF-8 対応）
         let filename = `media.${format}`;
         const disposition = res.headers.get('Content-Disposition');
         if (disposition) {
@@ -303,7 +467,6 @@
           }
         }
 
-        // バイナリデータを Blob 化してブラウザにダウンロードさせる
         const blob = await res.blob();
         const blobUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -323,9 +486,8 @@
     }
 
     // 動画や音声ファイルをプロキシ経由または直接Blob化して保存する関数
-    async function directDownloadMedia(url, defaultFilename) {
+    async function directDownloadMedia(url, defaultFilename, fallbackExt = 'mp4') {
       try {
-        // CORS・403回避のため元ページReferer付きで/proxy経由で取得
         const proxyUrl = `/proxy?url=${encodeURIComponent(url)}&referer=${encodeURIComponent(currentScrapedUrl)}`;
         const res = await fetch(proxyUrl);
         if (!res.ok) throw new Error('Fetch failed');
@@ -333,8 +495,7 @@
         const blobUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = blobUrl;
-        // 強化版判定関数を使用して正確な動画・音声拡張子を決定
-        const ext = detectImageExtension(url, blob.type, 'mp4');
+        const ext = detectImageExtension(url, blob.type, fallbackExt);
         a.download = `${defaultFilename}.${ext}`;
         document.body.appendChild(a);
         a.click();
@@ -347,7 +508,6 @@
 
     function applyImageFilter(card) {
       const minSize = parseInt(document.getElementById('minSizeSelect').value, 10);
-      // まだ画像サイズが読み込まれていない場合は判定を保留（表示のまま維持）
       if (!card.dataset.loaded) {
         return;
       }
@@ -355,13 +515,18 @@
       const h = parseInt(card.dataset.height || '0', 10);
       const checkbox = card.querySelector('.img-select-check');
 
-      // 0指定（すべて表示）またはサイズ条件を満たす場合
       if (minSize === 0 || w >= minSize || h >= minSize) {
         card.style.display = 'block';
-        if (checkbox) checkbox.checked = true;
+        if (checkbox && card.dataset.wasHidden === 'true') {
+          checkbox.checked = true;
+          delete card.dataset.wasHidden;
+        }
       } else {
         card.style.display = 'none';
-        if (checkbox) checkbox.checked = false;
+        if (checkbox) {
+          checkbox.checked = false;
+          card.dataset.wasHidden = 'true';
+        }
       }
       updateVisibleCount();
     }
@@ -372,7 +537,12 @@
 
     function updateVisibleCount() {
       const visibleCards = document.querySelectorAll('.image-card:not([style*="display: none"])');
+      const selectedChecks = document.querySelectorAll('.image-card:not([style*="display: none"]) .img-select-check:checked');
       document.getElementById('imgCount').innerText = visibleCards.length;
+      const selectedSpan = document.getElementById('selectedImgCount');
+      if (selectedSpan) {
+        selectedSpan.innerText = selectedChecks.length;
+      }
     }
 
     // Blob画像を目的の拡張子（JPG, PNG, WebP）にCanvas経由で変換する関数
@@ -381,7 +551,7 @@
         return { blob: sourceBlob, ext: originalExt };
       }
 
-      return new Promise((resolve, reject) => {
+      return new Promise((resolve) => {
         const img = new Image();
         const url = URL.createObjectURL(sourceBlob);
         img.onload = () => {
@@ -391,7 +561,6 @@
           canvas.height = img.naturalHeight;
           const ctx = canvas.getContext('2d');
 
-          // JPG変換時は透過部分が黒くならないように背景を白で塗りつぶす
           if (targetFormat === 'jpeg') {
             ctx.fillStyle = '#FFFFFF';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -417,7 +586,7 @@
       });
     }
 
-    // 選択画像を ZIP にまとめて一括保存する関数
+    // 選択画像を ZIP にまとめて一括保存する関数（3並列ダウンロード高速化版）
     async function downloadSelectedImagesAsZip(btn) {
       const selected = Array.from(document.querySelectorAll('.img-select-check:checked')).map(cb => cb.value);
       if (selected.length === 0) {
@@ -426,7 +595,6 @@
       }
 
       const originalText = btn.innerText;
-      btn.innerText = `⏳ ZIP作成中 (0/${selected.length})...`;
       btn.disabled = true;
 
       const targetFormat = document.getElementById('imageFormatSelect').value;
@@ -434,30 +602,47 @@
       const safeTitle = currentTitle.replace(/[\\/:*?"<>|\r\n\t]/g, '_').trim() || 'images';
 
       try {
-        for (let i = 0; i < selected.length; i++) {
-          const url = selected[i];
-          btn.innerText = `⏳ ZIP作成中 (${i + 1}/${selected.length})...`;
+        let completedCount = 0;
+        const concurrency = 3;
+        const tasks = selected.map((url, i) => ({ url, index: i }));
 
-          try {
-            const res = await fetch(`/proxy?url=${encodeURIComponent(url)}&referer=${encodeURIComponent(currentScrapedUrl)}`);
-            if (!res.ok) continue;
-            const originalBlob = await res.blob();
-            const originalExt = detectImageExtension(url, originalBlob.type, 'jpg');
+        const downloadWorker = async () => {
+          while (tasks.length > 0) {
+            const task = tasks.shift();
+            if (!task) break;
 
-            const { blob, ext } = await convertImageBlob(originalBlob, targetFormat, originalExt);
-            const filename = `image_${String(i + 1).padStart(3, '0')}.${ext}`;
-            zip.file(filename, blob);
-          } catch (e) {
-            console.error('Image fetch failed:', url, e);
+            try {
+              const res = await fetch(`/proxy?url=${encodeURIComponent(task.url)}&referer=${encodeURIComponent(currentScrapedUrl)}`);
+              if (res.ok) {
+                const originalBlob = await res.blob();
+                const originalExt = detectImageExtension(task.url, originalBlob.type, 'jpg');
+                const { blob, ext } = await convertImageBlob(originalBlob, targetFormat, originalExt);
+                const filename = `image_${String(task.index + 1).padStart(3, '0')}.${ext}`;
+                zip.file(filename, blob);
+              }
+            } catch (e) {
+              console.error('Image fetch failed:', task.url, e);
+            }
+
+            completedCount++;
+            btn.innerText = `⏳ ZIP作成中 (${completedCount}/${selected.length})...`;
           }
+        };
+
+        await Promise.all(Array.from({ length: Math.min(concurrency, selected.length) }, () => downloadWorker()));
+
+        const fileKeys = Object.keys(zip.files);
+        if (fileKeys.length === 0) {
+          throw new Error('画像の取得に失敗したため、ZIPを作成できませんでした。');
         }
 
-        btn.innerText = '⏳ ZIP圧縮中...';
+        const isCbz = targetFormat === 'cbz';
+        btn.innerText = isCbz ? '⏳ CBZ作成中...' : '⏳ ZIP圧縮中...';
         const zipBlob = await zip.generateAsync({ type: 'blob' });
         const blobUrl = URL.createObjectURL(zipBlob);
         const a = document.createElement('a');
         a.href = blobUrl;
-        a.download = `${safeTitle}_images.zip`;
+        a.download = isCbz ? `${safeTitle}.cbz` : `${safeTitle}_images.zip`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -471,48 +656,154 @@
       }
     }
 
-    // 選択画像を1枚ずつ個別保存する関数（フォーマット変換対応）
+    // 選択された複数画像を1冊のPDF電子書籍として結合保存する関数
+    async function downloadSelectedImagesAsPdfBook(btn) {
+      const visibleChecked = Array.from(
+        document.querySelectorAll('.image-card:not([style*="display: none"]) .img-select-check:checked')
+      ).map(cb => cb.value);
+
+      if (visibleChecked.length === 0) {
+        alert('PDFにまとめたい画像にチェックを入れてください。');
+        return;
+      }
+
+      if (!window.jspdf || !window.jspdf.jsPDF) {
+        alert('PDF生成ライブラリの読み込みに失敗しました。ページを再読み込みしてください。');
+        return;
+      }
+
+      const originalText = btn.innerText;
+      btn.disabled = true;
+      const safeTitle = currentTitle.replace(/[\\/:*?"<>|\r\n\t]/g, '_').trim() || 'comic_book';
+
+      try {
+        let pdfDoc = null;
+
+        let completedCount = 0;
+        const concurrency = 3;
+        const downloadedBlobs = new Array(visibleChecked.length);
+        const tasks = visibleChecked.map((url, i) => ({ url, index: i }));
+
+        const pdfWorker = async () => {
+          while (tasks.length > 0) {
+            const task = tasks.shift();
+            if (!task) break;
+
+            try {
+              const res = await fetch(`/proxy?url=${encodeURIComponent(task.url)}&referer=${encodeURIComponent(currentScrapedUrl)}`);
+              if (res.ok) {
+                downloadedBlobs[task.index] = await res.blob();
+              }
+            } catch (e) {
+              console.error('Image PDF fetch failed:', task.url, e);
+            }
+            completedCount++;
+            btn.innerText = `⏳ 画像取得中 (${completedCount}/${visibleChecked.length})...`;
+          }
+        };
+
+        await Promise.all(Array.from({ length: Math.min(concurrency, visibleChecked.length) }, () => pdfWorker()));
+
+        for (let i = 0; i < downloadedBlobs.length; i++) {
+          const blob = downloadedBlobs[i];
+          if (!blob) continue;
+
+          btn.innerText = `⏳ PDF結合中 (${i + 1}/${visibleChecked.length})...`;
+          try {
+            const imgBitmap = await createImageBitmap(blob);
+            const w = imgBitmap.width;
+            const h = imgBitmap.height;
+            const isLandscape = w > h;
+            const orientation = isLandscape ? 'landscape' : 'portrait';
+
+            if (!pdfDoc) {
+              pdfDoc = new window.jspdf.jsPDF({
+                orientation: orientation,
+                unit: 'px',
+                format: [w, h]
+              });
+            } else {
+              pdfDoc.addPage([w, h], orientation);
+            }
+
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(imgBitmap, 0, 0);
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+
+            if (typeof imgBitmap.close === 'function') {
+              imgBitmap.close();
+            }
+
+            pdfDoc.addImage(dataUrl, 'JPEG', 0, 0, w, h);
+          } catch (e) {
+            console.error('PDF page render failed at index:', i, e);
+          }
+        }
+
+        if (!pdfDoc) {
+          throw new Error('有効な画像を取得できませんでした。');
+        }
+
+        btn.innerText = '⏳ PDF保存中...';
+        pdfDoc.save(`${safeTitle}.pdf`);
+      } catch (err) {
+        alert('❌ PDF結合エラー: ' + err.message);
+      } finally {
+        btn.innerText = originalText;
+        btn.disabled = false;
+      }
+    }
+
+    // 選択画像を1枚ずつ個別保存する関数
     async function downloadSelectedImages(btn) {
-      const selected = Array.from(document.querySelectorAll('.img-select-check:checked')).map(cb => cb.value);
-      if (selected.length === 0) {
+      const visibleChecked = Array.from(
+        document.querySelectorAll('.image-card:not([style*="display: none"]) .img-select-check:checked')
+      ).map(cb => cb.value);
+
+      if (visibleChecked.length === 0) {
         alert('保存したい画像にチェックを入れてください。');
         return;
       }
 
-      if (!confirm(`選択した ${selected.length} 枚の画像をダウンロードしますか？`)) return;
+      if (!confirm(`選択した ${visibleChecked.length} 枚の画像をダウンロードしますか？`)) return;
 
       const originalText = btn.innerText;
       btn.disabled = true;
       const targetFormat = document.getElementById('imageFormatSelect').value;
 
-      for (let i = 0; i < selected.length; i++) {
-        const url = selected[i];
-        btn.innerText = `💾 保存中 (${i + 1}/${selected.length})...`;
-        try {
-          const res = await fetch(`/proxy?url=${encodeURIComponent(url)}&referer=${encodeURIComponent(currentScrapedUrl)}`);
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          const originalBlob = await res.blob();
-          const originalExt = detectImageExtension(url, originalBlob.type, 'jpg');
+      try {
+        for (let i = 0; i < visibleChecked.length; i++) {
+          const url = visibleChecked[i];
+          btn.innerText = `💾 保存中 (${i + 1}/${visibleChecked.length})...`;
+          try {
+            const res = await fetch(`/proxy?url=${encodeURIComponent(url)}&referer=${encodeURIComponent(currentScrapedUrl)}`);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const originalBlob = await res.blob();
+            const originalExt = detectImageExtension(url, originalBlob.type, 'jpg');
 
-          const { blob, ext } = await convertImageBlob(originalBlob, targetFormat, originalExt);
-          const blobUrl = URL.createObjectURL(blob);
-          
-          const a = document.createElement('a');
-          a.href = blobUrl;
-          a.download = `image_${String(i + 1).padStart(3, '0')}.${ext}`;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          URL.revokeObjectURL(blobUrl);
+            const { blob, ext } = await convertImageBlob(originalBlob, targetFormat, originalExt);
+            const blobUrl = URL.createObjectURL(blob);
+            
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            a.download = `image_${String(i + 1).padStart(3, '0')}.${ext}`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(blobUrl);
 
-          await new Promise(r => setTimeout(r, 200));
-        } catch (e) {
-          console.error('Download error:', url, e);
+            await new Promise(r => setTimeout(r, 200));
+          } catch (e) {
+            console.error('Download error:', url, e);
+          }
         }
+      } finally {
+        btn.innerText = originalText;
+        btn.disabled = false;
       }
-
-      btn.innerText = originalText;
-      btn.disabled = false;
     }
 
     async function downloadTextFormatted(btn) {
@@ -524,35 +815,55 @@
       const format = document.getElementById('textFormatSelect').value;
       const safeTitle = currentTitle.replace(/[\\/:*?"<>|\r\n\t]/g, '_').trim() || 'scraped_text';
 
-      // 1. PDF 形式で保存
       if (format === 'pdf') {
-        const targetUrl = currentScrapedUrl || document.getElementById('urlInput').value.trim();
-        const originalText = btn.innerText;
-        btn.innerText = '⏳ PDF生成中...';
-        btn.disabled = true;
+        const escapedTitle = escapeHtml(currentTitle);
+        const bodyContent = currentParagraphs
+          .map(p => `<div class="block">${escapeHtml(p)}</div>`)
+          .join('\n<hr>\n');
 
-        try {
-          const res = await fetch(`/pdf?url=${encodeURIComponent(targetUrl)}`);
-          if (!res.ok) throw new Error(await res.text());
-          const blob = await res.blob();
-          const blobUrl = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = blobUrl;
-          a.download = `${safeTitle}.pdf`;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          URL.revokeObjectURL(blobUrl);
-        } catch (err) {
-          alert('❌ PDF出力エラー: ' + err.message);
-        } finally {
-          btn.innerText = originalText;
-          btn.disabled = false;
+        const printWindow = window.open('', '_blank');
+        if (!printWindow) {
+          alert('ポップアップがブロックされました。ブラウザの設定で許可してください。');
+          return;
         }
+
+        printWindow.document.write(`<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>${escapedTitle}</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/sunfish-shogi/saitamaar/dist/saitamaar.css">
+  <style>
+    @page { margin: 15mm; size: auto; }
+    body {
+      font-family: 'Saitamaar', 'MS PGothic', 'MS Pゴシック', 'IPAMonaPGothic', 'Mona', 'Textar', 'Hiragino Kaku Gothic ProN', sans-serif;
+      font-size: 14px;
+      line-height: 16px;
+      letter-spacing: 0;
+      white-space: pre;
+      word-break: normal;
+      background: #fff;
+      color: #000;
+      padding: 10px;
+    }
+    .block { margin-bottom: 20px; page-break-inside: avoid; }
+    hr { border: none; border-top: 1px dashed #999; margin: 20px 0; }
+  </style>
+</head>
+<body>
+  <h2 style="font-family: sans-serif; white-space: normal; margin-bottom: 15px;">${escapedTitle}</h2>
+  ${bodyContent}
+  <script>
+    window.onload = function() {
+      window.print();
+    };
+  <\/script>
+</body>
+</html>`);
+        printWindow.document.close();
         return;
       }
 
-      // 2. HTML 形式で保存（元のフォント・AAスタイルをCSSで埋め込んだ単体ファイル）
       if (format === 'html') {
         const escapedTitle = escapeHtml(currentTitle);
         const bodyContent = currentParagraphs
@@ -564,9 +875,10 @@
 <head>
   <meta charset="UTF-8">
   <title>${escapedTitle}</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/sunfish-shogi/saitamaar/dist/saitamaar.css">
   <style>
     body {
-      font-family: 'MS PGothic', 'MS Pゴシック', 'IPAMonaPGothic', 'Mona', 'Hiragino Kaku Gothic ProN', sans-serif;
+      font-family: 'Saitamaar', 'MS PGothic', 'MS Pゴシック', 'IPAMonaPGothic', 'Mona', 'Textar', 'Hiragino Kaku Gothic ProN', sans-serif;
       font-size: 16px;
       line-height: 18px;
       letter-spacing: 0;
@@ -599,7 +911,6 @@
         return;
       }
 
-      // 3. テキスト (.txt) 形式で保存
       const textContent = currentParagraphs.join('\n\n----------------------------------------\n\n');
       const blob = new Blob(['\uFEFF' + textContent], { type: 'text/plain;charset=utf-8' });
       const blobUrl = URL.createObjectURL(blob);
@@ -612,31 +923,43 @@
       URL.revokeObjectURL(blobUrl);
     }
 
-    // 設定パネルの開閉
     function toggleSettings() {
       const panel = document.getElementById('settingsPanel');
       panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
     }
 
-    // Cookie保存
-    function savePixivCookie() {
-      const val = document.getElementById('pixivCookieInput').value.trim();
-      localStorage.setItem('pixiv_phpsessid', val);
-      alert(val ? 'Pixiv Cookie を保存しました！' : 'Cookie をクリアしました。');
+    function saveCookies() {
+      const pixivVal = document.getElementById('pixivCookieInput').value.trim();
+      const twitterVal = document.getElementById('twitterCookieInput').value.trim();
+      if (pixivVal) {
+        localStorage.setItem('pixiv_phpsessid', pixivVal);
+      } else {
+        localStorage.removeItem('pixiv_phpsessid');
+      }
+      if (twitterVal) {
+        localStorage.setItem('twitter_auth_token', twitterVal);
+      } else {
+        localStorage.removeItem('twitter_auth_token');
+      }
+      alert('Cookie 設定を保存しました！');
     }
 
-    // Cookie削除
-    function clearPixivCookie() {
+    function clearCookies() {
       localStorage.removeItem('pixiv_phpsessid');
+      localStorage.removeItem('twitter_auth_token');
       document.getElementById('pixivCookieInput').value = '';
-      alert('Pixiv Cookie を削除しました。');
+      document.getElementById('twitterCookieInput').value = '';
+      alert('Cookie を削除しました。');
     }
 
-    // 画面読み込み時に保存済みCookieを復元
     window.addEventListener('DOMContentLoaded', () => {
-      const savedCookie = localStorage.getItem('pixiv_phpsessid');
-      if (savedCookie) {
-        document.getElementById('pixivCookieInput').value = savedCookie;
+      const savedPixiv = localStorage.getItem('pixiv_phpsessid');
+      if (savedPixiv) {
+        document.getElementById('pixivCookieInput').value = savedPixiv;
+      }
+      const savedTwitter = localStorage.getItem('twitter_auth_token');
+      if (savedTwitter) {
+        document.getElementById('twitterCookieInput').value = savedTwitter;
       }
     });
 
@@ -665,11 +988,29 @@
 
       try {
         const pixivCookie = localStorage.getItem('pixiv_phpsessid') || '';
-        const fetchUrl = `/scrape?url=${encodeURIComponent(urlInput)}${pixivCookie ? `&pixiv_cookie=${encodeURIComponent(pixivCookie)}` : ''}`;
-        const res = await fetch(fetchUrl);
+        const twitterCookie = localStorage.getItem('twitter_auth_token') || '';
+        
+        // 認証情報を安全に POST リクエストで送信
+        const res = await fetch('/scrape', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            url: urlInput,
+            pixiv_cookie: pixivCookie,
+            twitter_cookie: twitterCookie
+          })
+        });
         
         if (!res.ok) {
-          throw new Error(await res.text());
+          const errText = await res.text();
+          if (res.status === 503) {
+            throw new Error('⏳ サーバーが混雑しています。数十秒待ってからもう一度お試しください。');
+          } else if (res.status === 429) {
+            throw new Error('⚠️ リクエストが集中しています。1分ほど時間をおいてからお試しください。');
+          }
+          throw new Error(errText);
         }
 
         const data = await res.json();
@@ -678,31 +1019,43 @@
         
         currentTitle = data.title || "scraped_data";
         currentParagraphs = data.paragraphs || [];
-        currentScrapedUrl = urlInput; // スクレイピングしたURLを保持
+        currentScrapedUrl = urlInput;
 
         // 画像の表示
         const imgContainer = document.getElementById('imageContainer');
         imgContainer.innerHTML = '';
         const rawImages = data.images || [];
+        document.getElementById('imgCount').innerText = '0';
+        document.getElementById('selectedImgCount').innerText = '0';
 
         rawImages.forEach((src) => {
           const card = document.createElement('div');
           card.className = 'image-card';
+          // 初期表示をブロックにして通信を確実に開始させる
+          card.style.display = 'block';
           
           const checkbox = document.createElement('input');
           checkbox.type = 'checkbox';
           checkbox.className = 'img-select-check';
           checkbox.value = src;
           checkbox.checked = true;
+          checkbox.addEventListener('change', updateVisibleCount);
 
           const sizeBadge = document.createElement('span');
           sizeBadge.className = 'size-badge';
+          sizeBadge.innerText = '読み込み中...';
 
           const img = document.createElement('img');
-          // 漫画サイト・Pixiv等のアクセス拒否(403)を防ぐため、元ページURLをrefererとして付与
+          // lazy属性を外して即座にプロキシ経由の取得を発火
           img.src = `/proxy?url=${encodeURIComponent(src)}&referer=${encodeURIComponent(currentScrapedUrl)}`;
-          img.loading = 'lazy';
           
+          // クリック時にギャラリーモーダルを開く
+          img.title = "クリックで拡大ギャラリー表示（左右キーで移動可能）";
+          img.onclick = () => {
+            openImageModalByElement(img);
+          };
+          
+          let retriedDirect = false;
           img.onload = () => {
             card.dataset.loaded = 'true';
             card.dataset.width = img.naturalWidth;
@@ -711,8 +1064,17 @@
             applyImageFilter(card);
           };
           img.onerror = () => {
-            card.remove();
-            updateVisibleCount();
+            if (!retriedDirect) {
+              retriedDirect = true;
+              // プロキシ失敗時はオリジナルの直リンクで再試行
+              img.src = src;
+            } else {
+              card.dataset.loaded = 'true';
+              card.dataset.width = '300';
+              card.dataset.height = '300';
+              sizeBadge.innerText = '画像読み込み失敗';
+              applyImageFilter(card);
+            }
           };
 
           card.appendChild(checkbox);
@@ -720,6 +1082,7 @@
           card.appendChild(sizeBadge);
           imgContainer.appendChild(card);
         });
+        updateVisibleCount();
 
         // 動画の表示
         const videoSection = document.getElementById('videoSection');
@@ -730,20 +1093,18 @@
 
         const seenVideos = new Set();
 
-        // 1. 直接再生可能な動画（.mp4 / .webm）が1つでもあるかチェック
         const hasDirectPlayableVideo = videos.some(src => {
           const clean = src.split(/[?#]/)[0].toLowerCase();
           return clean.endsWith('.mp4') || clean.endsWith('.webm') || src.includes('youtube.com') || src.includes('youtu.be') || src.includes('nicovideo.jp');
         });
 
-        videos.forEach((src, idx) => {
+        videos.forEach((src) => {
           if (!src || src.startsWith('blob:') || src.startsWith('data:') || src.startsWith('about:')) {
             return;
           }
 
           const cleanSrc = src.split(/[?#]/)[0].toLowerCase();
 
-          // 2. プレビュー可能な本編がある場合、余計なストリーム（m3u8）カードは邪魔なので除外
           if (hasDirectPlayableVideo && cleanSrc.endsWith('.m3u8')) {
             return;
           }
@@ -753,26 +1114,29 @@
           let mediaType = 'video';
           let youtubeId = '';
 
-          // YouTube IDの判定
-          if (src.includes('youtube.com') || src.includes('youtu.be/')) {
-            if (src.includes('youtu.be/')) {
-              youtubeId = src.split('youtu.be/')[1].split(/[?#/]/)[0];
-            } else if (src.includes('/embed/')) {
-              youtubeId = src.split('/embed/')[1].split(/[?#/]/)[0];
-            } else if (src.includes('/shorts/')) {
-              youtubeId = src.split('/shorts/')[1].split(/[?#/]/)[0];
-            } else {
-              try {
-                youtubeId = new URL(src, location.href).searchParams.get('v') || '';
-              } catch(e) {}
+          // YouTube IDの安全な抽出
+          try {
+            const parsedUrl = new URL(src, location.href);
+            const host = parsedUrl.hostname.toLowerCase();
+            if (host.includes('youtube.com') || host.includes('youtu.be')) {
+              if (host.includes('youtu.be')) {
+                youtubeId = parsedUrl.pathname.replace(/^\//, '').split('/')[0];
+              } else if (parsedUrl.pathname.startsWith('/embed/')) {
+                youtubeId = parsedUrl.pathname.split('/embed/')[1].split('/')[0];
+              } else if (parsedUrl.pathname.startsWith('/shorts/')) {
+                youtubeId = parsedUrl.pathname.split('/shorts/')[1].split('/')[0];
+              } else {
+                youtubeId = parsedUrl.searchParams.get('v') || '';
+              }
             }
+          } catch (e) {}
 
-            // IDが取れない不正リンクはスキップ
-            if (!youtubeId || youtubeId.length < 8) return;
+          if (youtubeId) {
+            youtubeId = youtubeId.replace(/[^a-zA-Z0-9_-]/g, '');
+            if (youtubeId.length < 8) return;
             mediaUrl = `https://www.youtube.com/watch?v=${youtubeId}`;
           }
 
-          // 重複除外
           if (seenVideos.has(mediaUrl)) return;
           seenVideos.add(mediaUrl);
 
@@ -788,8 +1152,22 @@
 
           if (isDirectFile) {
             const videoElem = document.createElement('video');
-            videoElem.src = src;
+            videoElem.src = `/proxy?url=${encodeURIComponent(src)}&referer=${encodeURIComponent(currentScrapedUrl)}`;
             videoElem.controls = true;
+            videoElem.preload = "metadata";
+            card.appendChild(videoElem);
+          } else if (mediaType === 'hls' || cleanSrc.endsWith('.m3u8')) {
+            const videoElem = document.createElement('video');
+            videoElem.controls = true;
+            const streamProxyUrl = `/proxy?url=${encodeURIComponent(src)}&referer=${encodeURIComponent(currentScrapedUrl)}`;
+
+            if (Hls.isSupported()) {
+              const hls = new Hls();
+              hls.loadSource(streamProxyUrl);
+              hls.attachMedia(videoElem);
+            } else if (videoElem.canPlayType('application/vnd.apple.mpegurl')) {
+              videoElem.src = streamProxyUrl;
+            }
             card.appendChild(videoElem);
           } else {
             if (youtubeId) {
@@ -812,10 +1190,9 @@
               iframeElem.setAttribute('frameborder', '0');
               card.appendChild(iframeElem);
             } else {
-              // X, XVideos等のiframe拒否サイトは専用ダウンロードバナーカードを表示
               const infoBox = document.createElement('div');
               infoBox.style = "background:#1e293b; color:#fff; padding:25px 15px; border-radius:6px; text-align:center; font-weight:bold; font-size:14px;";
-              infoBox.innerHTML = `🎬 本編動画ストリームを検出<br><span style="font-size:11px; color:#94a3b8; font-weight:normal; word-break:break-all;">${escapeHtml(src)}</span>`;
+              infoBox.innerHTML = `🎬 本編動画リンクを検出<br><span style="font-size:11px; color:#94a3b8; font-weight:normal; word-break:break-all;">${escapeHtml(src)}</span>`;
               card.appendChild(infoBox);
             }
           }
@@ -823,7 +1200,6 @@
           const actionDiv = document.createElement('div');
           actionDiv.style = "margin-top:10px; display:flex; align-items:center; flex-wrap:wrap; gap:8px;";
 
-          // すべての動画カードに「画質確認」＋「画質選択プルダウン」＋「保存ボタン」を共通で配置
           const formatSelect = document.createElement('select');
           formatSelect.innerHTML = `
             <option value="mp4" selected>🎬 最高画質 (自動最高解像度)</option>
@@ -833,7 +1209,6 @@
             <option value="wav">🎵 音声のみ (WAV)</option>
           `;
 
-          // 実際の画質一覧を問い合わせるボタン
           const checkBtn = document.createElement('button');
           checkBtn.type = 'button';
           checkBtn.style = "background:#475569; color:#fff; font-size:11px; padding:6px 10px; border-radius:4px; border:none; cursor:pointer;";
@@ -842,12 +1217,12 @@
             this.disabled = true;
             this.innerText = "⏳ 調査中...";
             try {
-              // 単体直リンクの場合は現在のページURLを優先して解析
-              const targetQueryUrl = (currentScrapedUrl && currentScrapedUrl.startsWith('http')) ? currentScrapedUrl : mediaUrl;
+              const targetQueryUrl = mediaUrl || currentScrapedUrl;
               const res = await fetch(`/video-formats?url=${encodeURIComponent(targetQueryUrl)}`);
-              if (!res.ok) throw new Error();
-              const heights = await res.json();
-              if (heights.length > 0) {
+              if (!res.ok) throw new Error('Fetch formats failed');
+              const data = await res.json();
+              if (Array.isArray(data) && data.length > 0) {
+                const heights = data.map(Number).filter(n => !isNaN(n) && n > 0).sort((a, b) => b - a);
                 formatSelect.innerHTML = '';
                 heights.forEach(h => {
                   const opt = document.createElement('option');
@@ -863,8 +1238,10 @@
                   formatSelect.appendChild(opt);
                 });
                 formatSelect.innerHTML += `
+                  <option value="webm">🎬 WebM 形式</option>
                   <option value="mp3">🎵 音声のみ (MP3)</option>
                   <option value="m4a">🎵 音声のみ (M4A)</option>
+                  <option value="wav">🎵 音声のみ (WAV)</option>
                 `;
                 this.innerText = `✅ ${heights.length}種類の画質を発見`;
               } else {
@@ -872,17 +1249,18 @@
               }
             } catch(e) {
               this.innerText = "⚠️ 取得失敗";
+            } finally {
+              this.disabled = false;
             }
           });
 
-          // 保存ボタン（yt-dlp 経由で高画質/指定画質をダウンロード）
           const dlBtn = document.createElement('button');
           dlBtn.type = 'button';
           dlBtn.style = "background:#e44d26; color:#fff; font-size:12px; padding:6px 12px; border-radius:4px; border:none; cursor:pointer; font-weight:bold;";
           dlBtn.innerText = "📥 保存";
           dlBtn.addEventListener('click', function() {
             const chosenFormat = formatSelect.value;
-            const downloadUrl = (currentScrapedUrl && currentScrapedUrl.startsWith('http')) ? currentScrapedUrl : mediaUrl;
+            const downloadUrl = mediaUrl || currentScrapedUrl;
             downloadWithYtDlp(this, downloadUrl, chosenFormat, mediaType);
           });
 
@@ -917,7 +1295,7 @@
             card.style = "background:#f5f5f5; padding:10px 15px; border-radius:6px; border:1px solid #ddd; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;";
             
             const audioElement = document.createElement('audio');
-            audioElement.src = src;
+            audioElement.src = `/proxy?url=${encodeURIComponent(src)}&referer=${encodeURIComponent(currentScrapedUrl)}`;
             audioElement.controls = true;
             audioElement.style = "flex:1; min-width:220px;";
 
@@ -928,7 +1306,7 @@
             dlBtn.type = 'button';
             dlBtn.style = "background:#2e7d32; color:#fff; font-size:12px; padding:6px 12px; border-radius:4px; border:none; cursor:pointer;";
             dlBtn.innerText = "💾 音声を保存";
-            dlBtn.addEventListener('click', () => directDownloadMedia(src, `audio_${idx + 1}`));
+            dlBtn.addEventListener('click', () => directDownloadMedia(src, `audio_${idx + 1}`, 'mp3'));
 
             const directLink = document.createElement('a');
             directLink.href = src;
