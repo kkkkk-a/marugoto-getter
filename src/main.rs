@@ -86,13 +86,22 @@ async fn main() {
         .build()
         .unwrap();
 
-    // 2. ヘッドレストブラウザ（Chromium/Chrome）の常駐起動
+    // 2. ヘッドレストブラウザ（Chromium/Chrome）の常駐起動（Render無料枠 512MB メモリ特化）
     println!("🌐 ヘッドレスブラウザ (Chromium) を起動中...");
     let (browser, mut handler) = Browser::launch(
         BrowserConfig::builder()
             .no_sandbox()
             .arg("--disable-gpu")
             .arg("--disable-dev-shm-usage")
+            .arg("--disable-setuid-sandbox")
+            .arg("--no-zygote")
+            .arg("--single-process")
+            .arg("--disable-extensions")
+            .arg("--disable-background-networking")
+            .arg("--disable-software-rasterizer")
+            .arg("--mute-audio")
+            .arg("--no-first-run")
+            .arg("--js-flags=--max-old-space-size=256")
             .arg("--disable-blink-features=AutomationControlled")
             .arg("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
             .build()
@@ -537,15 +546,15 @@ async fn scrape_handler(
                 }
             }
 
-            // クリック後に画像がDOMに読み込まれるまで1秒待機
-            await new Promise(r => setTimeout(r, 1200));
+            // クリック後に画像がDOMに読み込まれるまで待機
+            await new Promise(r => setTimeout(r, 600));
 
-            // 漫画サイトの全ページ画像を読み込ませるため、下部まで段階的に自動スクロール
+            // Renderの低CPUでもフリーズしないよう高速・大股スクロール（全自動走査）
             await new Promise((resolve) => {
                 let totalHeight = 0;
-                const distance = 400;
+                const distance = 1200; // 一気にスクロールして高速化
                 let steps = 0;
-                const maxSteps = 100; // 無限スクロール対策（最大約40000px）
+                const maxSteps = 25;
                 const timer = setInterval(() => {
                     const scrollHeight = document.body.scrollHeight;
                     window.scrollBy(0, distance);
@@ -554,15 +563,15 @@ async fn scrape_handler(
 
                     if (totalHeight >= scrollHeight || steps >= maxSteps) {
                         clearInterval(timer);
-                        window.scrollTo(0, 0); // スクロール完了後に最上部へ戻す
+                        window.scrollTo(0, 0);
                         resolve();
                     }
-                }, 100);
+                }, 60);
             });
         })()
     "#;
     let _ = page.evaluate(expand_and_scroll_script).await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // 4. JavaScript実行・描画完了後の完全なDOM HTMLを取得（エラー時も確実にタブを閉じてメモリ解放）
     let html_content_result = page.content().await;
